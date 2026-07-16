@@ -1,0 +1,21 @@
+Phase 1: Completed
+Setting up initial environment: Done
+intercepting Graphql: Done
+using devtools to get the cURL command: Done
+Bypassed Cloudfare: Done
+simplified deeply nested json 200 response: Done
+Completing scraper.py's functioning: Done
+
+Phase 2: Completed
+Setting up Discord bot: Done
+Testing the discord bot in a server: Done
+setting up a loop so bot continuously get new jobs posted (every 10s): Done
+Tested and verified the final work of bot: Done
+
+Phase 3 Half completed:
+setting up selenium and configuring it with discord bot: Done
+used a dedicated chrome profile to load and verify the Cloudflare: Done
+automatically gets the cookies when needed from that tab: Done
+headless execution (invisible browser): issue - i tried to open an invisible browser so the auth_manager.py get cookies on its own without me needing to open the chrome manually (not even once), but it doesn't seem to work. attempts keep getting failed. 
+
+ 

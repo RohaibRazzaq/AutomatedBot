@@ -1,0 +1,19 @@
+WorkFlow:
+
+1. Phase 1: Reverse Engineering the API
+Analyze Network Traffic: We will use Chrome DevTools to observe what happens when a real browser searches for jobs on Upwork.  Identify GraphQL Queries: We will extract the exact GraphQL queries, variables, and aliases (like visitorJobSearch) Upwork uses to fetch job data.  Extract Fingerprints: We will capture all the required HTTP headers and cookies necessary to mimic a real user.  Build Initial HTTP Scraper: We will write our first Python script using requests or cloudscraper to successfully fetch job listings directly from the API, bypassing the slow browser.
+
+2. Phase 2: Discord IntegrationBot Setup: 
+We will initialize the bot using the discord.py library and create a loop that runs every 5-10 seconds.  Message Formatting: We will format the job data into professional Discord messages containing the title, posted time, budget, experience level, and a description preview.  Automatic Threads: We will program the bot to automatically create a Discord thread under each job post containing the full job description and detailed client history. 
+
+3. Phase 3: Authentication ManagementImplement Hybrid Auth: 
+We will build the AuthManager class to handle the fact that Upwork tokens expire every 12 hours.  Headless Extraction: We will use selenium or playwright to launch an invisible, headless browser that navigates to Upwork and extracts fresh cookies and localStorage tokens.  Proactive Refreshing: We will set up a timer to automatically trigger this background browser every 11 hours to seamlessly swap in new tokens without stopping the main HTTP scraping loop.  
+
+4. Phase 4: Multi-URL SupportConfiguration File: 
+We will create a config.json file to map multiple different Upwork search URLs to specific Discord channels.  Concurrent/Sequential Processing: We will update our scraper loop to check all tracked URLs simultaneously or one after the other.  Deduplication Database: We will set up a SQLite or PostgreSQL database to track the job_id and url_source to ensure the bot never posts duplicate jobs to the same channel.  
+
+5. Phase 5: Production HardeningError Handling: 
+We will add retry logic with exponential backoff for network timeouts and handle Discord's API rate limits safely.  Logging: We will implement a professional logging system to track warnings, errors, and bot health in a bot.log file.  Resource Management: We will add memory monitoring using psutil to track RAM usage and automated database cleanup scripts to remove old jobs.  Graceful Shutdown: We will handle system signals to ensure the bot saves its state and closes connections cleanly if it shuts down. 
+ 
+6. Final Polish & TestingDocumentation: 
+We will write a comprehensive User Manual detailing setup, configuration, and troubleshooting procedures.  Video Demo: We will record a 5-10 minute Loom video explaining the features, walking through the code, and providing a live demonstration.  100-Hour Stability Test: Finally, we will run the bot continuously for 100 hours (4+ days) with zero manual intervention to prove it can handle token refreshes, memory management, and error recovery without crashing.  
