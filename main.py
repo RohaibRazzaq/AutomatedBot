@@ -1,14 +1,16 @@
 import asyncio
 import signal
 import sys
-import discord
-from discord.ext import commands, tasks
 import os
 from dotenv import load_dotenv
 
-from scraper import fetch_jobs
-
+# Load .env BEFORE importing scraper (scraper reads BROWSER_HEADLESS from env)
 load_dotenv()
+
+import discord
+from discord.ext import commands, tasks
+from scraper import fetch_jobs, auth_manager
+
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 TARGET_CHANNEL_ID = 1526858039993569382
 
@@ -61,6 +63,9 @@ def get_unposted_jobs():
 @bot.event
 async def on_ready():
     print(f"--- BOT IS ONLINE ---")
+    print("Starting browser for Cloudflare bypass...")
+    await asyncio.to_thread(auth_manager.start)
+    print("Browser ready, starting job scraper loop...")
     job_scraper_loop.start()
 
 @tasks.loop(seconds=10)
@@ -100,6 +105,7 @@ async def job_scraper_loop():
 
 def signal_handler(sig, frame):
     print("\nShutting down bot...")
+    auth_manager.stop()
     sys.exit(0)
 
 if __name__ == "__main__":
@@ -110,4 +116,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nBot terminated by user")
     finally:
+        auth_manager.stop()
         print("Cleanup complete")

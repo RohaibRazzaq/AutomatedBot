@@ -1,2 +1,3 @@
-2026/07/15-15:06:04.544 a920 Creating DB E:\Bitbash\DIscordBot\BotProfile\Default\shared_proto_db since it was missing.
-2026/07/15-15:06:04.569 a920 Reusing MANIFEST E:\Bitbash\DIscordBot\BotProfile\Default\shared_proto_db/MANIFEST-000001
+2026/07/17-13:03:33.493 547c Reusing MANIFEST E:\Bitbash\AutomatedBot\BotProfile\Default\shared_proto_db/MANIFEST-000001
+2026/07/17-13:03:33.493 547c Recovering log #3
+2026/07/17-13:03:33.493 547c Reusing old log E:\Bitbash\AutomatedBot\BotProfile\Default\shared_proto_db/000003.log 
