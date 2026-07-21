@@ -22,7 +22,9 @@ from seleniumbase import SB
 
 BOT_PROFILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "BotProfile")
 UPWORK_SEARCH_URL = "https://www.upwork.com/nx/search/jobs/?q={}"
-SESSION_REFRESH_INTERVAL = 1200  # Refresh Cloudflare clearance every 20 minutes
+SESSION_REFRESH_INTERVAL = 1200    # Refresh Cloudflare clearance every 20 minutes
+BROWSER_RESTART_INTERVAL = 14400   # Restart browser every 4 hours (memory leak fix)
+TOKEN_REFRESH_INTERVAL = 39600     # Force token refresh every 11 hours (12-hour token lifetime)
 
 
 class AuthManager:
@@ -33,6 +35,7 @@ class AuthManager:
         self.sb = None
         self._lock = threading.Lock()
         self._last_refresh = 0
+        self._last_browser_start = 0
         self._headless = headless
         self._started = False
 
@@ -65,6 +68,7 @@ class AuthManager:
         self._started = True
 
         self._navigate_and_solve_cf("python")
+        self._last_browser_start = time.time()
         print("[AuthManager] Browser ready. Cloudflare bypassed.")
 
     def _navigate_and_solve_cf(self, keyword):
@@ -87,11 +91,51 @@ class AuthManager:
         self.sb.sleep(3)
         self._last_refresh = time.time()
 
+    def _restart_browser(self):
+        """Restart the browser to clear memory leaks and get fresh tokens."""
+        print("[AuthManager] Restarting browser for maintenance...")
+        self.stop()
+        time.sleep(2)  # Give Chrome time to fully close
+        self.start()
+        print("[AuthManager] Browser restarted successfully.")
+
     def _ensure_session(self):
-        """Refresh Cloudflare clearance if the session is stale."""
-        if time.time() - self._last_refresh > SESSION_REFRESH_INTERVAL:
+        """Proactively refresh Cloudflare clearance, restart browser, and refresh tokens.
+
+        Three layered checks:
+          1. Every 4 hours  -> restart browser (kills Chrome memory leaks, gets fresh cookies/tokens)
+          2. Every 11 hours -> force restart (safety net for 12-hour token lifetime, in case #1 failed)
+          3. Every 20 min   -> re-navigate to Upwork (refreshes Cloudflare cf_clearance)
+
+        All operations are wrapped in try/except so a failure here never crashes the caller.
+        """
+        now = time.time()
+
+        # 1. Every 4 hours: full browser restart (memory + fresh state)
+        if now - self._last_browser_start > BROWSER_RESTART_INTERVAL:
+            try:
+                self._restart_browser()
+                return
+            except Exception as e:
+                print(f"[AuthManager] 4-hour browser restart failed: {e}")
+                # Fall through to session refresh as fallback
+
+        # 2. Every 11 hours: force restart for token refresh (safety net)
+        if now - self._last_browser_start > TOKEN_REFRESH_INTERVAL:
+            try:
+                print("[AuthManager] 11-hour token refresh: forcing browser restart...")
+                self._restart_browser()
+                return
+            except Exception as e:
+                print(f"[AuthManager] 11-hour token refresh failed: {e}")
+
+        # 3. Every 20 minutes: refresh Cloudflare clearance by re-navigating
+        if now - self._last_refresh > SESSION_REFRESH_INTERVAL:
             print("[AuthManager] Session stale, refreshing Cloudflare clearance...")
-            self._navigate_and_solve_cf("python")
+            try:
+                self._navigate_and_solve_cf("python")
+            except Exception as e:
+                print(f"[AuthManager] Session refresh failed: {e}")
 
     def _is_driver_alive(self):
         """Check if the WebDriver session is still alive."""
@@ -102,6 +146,27 @@ class AuthManager:
             return True
         except Exception:
             return False
+
+    def _get_auth_token(self):
+        """Extract the auth token from Upwork cookies using WebDriver's API.
+
+        WebDriver's get_cookies() can access ALL cookies including HttpOnly ones,
+        unlike document.cookie which only sees non-HttpOnly cookies.
+        Returns the token string or empty string if not found.
+        """
+        try:
+            cookies = self.sb.driver.get_cookies()
+            for cookie in cookies:
+                name = cookie.get('name', '')
+                if name == 'UniversalSearchNuxt_vt':
+                    return cookie.get('value', '')
+            # Token cookie not found — log available cookie names for diagnostics
+            names = [c.get('name', '?') for c in cookies]
+            print(f"[AuthManager] Auth token cookie not found. Available cookies ({len(names)}): {', '.join(names[:20])}")
+            return ''
+        except Exception as e:
+            print(f"[AuthManager] Failed to read cookies: {e}")
+            return ''
 
     def execute_graphql(self, json_data):
         """
@@ -128,19 +193,7 @@ class AuthManager:
         js_code = """
         var callback = arguments[arguments.length - 1];
         var payload = arguments[0];
-
-        // Extract the authorization token from the UniversalSearchNuxt_vt cookie.
-        // The browser sends cookies automatically, but the GraphQL API also
-        // requires an explicit Authorization: Bearer <token> header.
-        var authToken = '';
-        var cookies = document.cookie.split(';');
-        for (var i = 0; i < cookies.length; i++) {
-            var c = cookies[i].trim();
-            if (c.startsWith('UniversalSearchNuxt_vt=')) {
-                authToken = c.substring('UniversalSearchNuxt_vt='.length);
-                break;
-            }
-        }
+        var authToken = arguments[1] || '';
 
         var headers = {
             'content-type': 'application/json',
@@ -178,16 +231,20 @@ class AuthManager:
                 print("[AuthManager] Not on Upwork, navigating back...")
                 self._navigate_and_solve_cf("python")
 
+            auth_token = self._get_auth_token()
+
             try:
                 self.sb.driver.set_script_timeout(30)
-                result = self.sb.driver.execute_async_script(js_code, json_data)
+                result = self.sb.driver.execute_async_script(js_code, json_data, auth_token)
             except Exception as e:
                 print(f"[AuthManager] GraphQL execution failed: {e}")
                 print("[AuthManager] Refreshing session and retrying...")
                 try:
                     self._navigate_and_solve_cf("python")
+                    self.sb.sleep(2)  # Extra wait for cookies to settle
+                    auth_token = self._get_auth_token()
                     self.sb.driver.set_script_timeout(30)
-                    result = self.sb.driver.execute_async_script(js_code, json_data)
+                    result = self.sb.driver.execute_async_script(js_code, json_data, auth_token)
                 except Exception as e2:
                     print(f"[AuthManager] Retry also failed: {e2}")
                     return None
@@ -197,11 +254,29 @@ class AuthManager:
             return None
 
         try:
-            return json.loads(result)
+            parsed = json.loads(result)
         except json.JSONDecodeError as e:
             print(f"[AuthManager] Failed to parse GraphQL response: {e}")
             print(f"[AuthManager] Raw response: {str(result)[:300]}")
             return None
+
+        # Detect auth failure in the response and retry once
+        msg = parsed.get('message', '') if isinstance(parsed, dict) else ''
+        if 'authentication' in msg.lower() or 'auth' in msg.lower():
+            print("[AuthManager] Auth failure detected in response, refreshing and retrying...")
+            try:
+                self._navigate_and_solve_cf("python")
+                self.sb.sleep(2)
+                new_token = self._get_auth_token()
+                self.sb.driver.set_script_timeout(30)
+                result2 = self.sb.driver.execute_async_script(js_code, json_data, new_token)
+                if result2:
+                    return json.loads(result2)
+            except Exception as e:
+                print(f"[AuthManager] Auth-retry also failed: {e}")
+            return parsed  # Return the original error response
+
+        return parsed
 
     def stop(self):
         """Close the browser and clean up."""

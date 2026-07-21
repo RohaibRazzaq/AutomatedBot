@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import os
+import time
 from datetime import datetime
 from auth_manager import AuthManager
 
@@ -52,32 +53,40 @@ def load_existing_job_ids():
 
 def save_job_to_db(job):
     """Save a single job to the SQLite database."""
-    conn = sqlite3.connect('jobs.db')
-    cursor = conn.cursor()
+    for attempt in range(3):
+        try:
+            conn = sqlite3.connect('jobs.db', timeout=10)
+            cursor = conn.cursor()
 
-    now = datetime.now().isoformat()
+            now = datetime.now().isoformat()
 
-    cursor.execute('''
-        INSERT OR REPLACE INTO jobs
-        (id, title, budget, experience_level, skills, description_preview, full_description, url, publish_time, first_seen, last_seen)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT first_seen FROM jobs WHERE id=?), ?), ?)
-    ''', (
-        job['id'],
-        job['title'],
-        job['budget'],
-        job['experience_level'],
-        ', '.join(job['skills']),
-        job['description_preview'],
-        job['full_description'],
-        job['url'],
-        job.get('publish_time'),
-        job['id'],
-        now,
-        now
-    ))
-
-    conn.commit()
-    conn.close()
+            cursor.execute('''
+                INSERT OR REPLACE INTO jobs
+                (id, title, budget, experience_level, skills, description_preview, full_description, url, publish_time, first_seen, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT first_seen FROM jobs WHERE id=?), ?), ?)
+            ''', (
+                job['id'],
+                job['title'],
+                job['budget'],
+                job['experience_level'],
+                ', '.join(job['skills']),
+                job['description_preview'],
+                job['full_description'],
+                job['url'],
+                job.get('publish_time'),
+                job['id'],
+                now,
+                now
+            ))
+            print("job saved in database")
+            conn.commit()
+            conn.close()
+            return
+        except sqlite3.OperationalError:
+            if attempt < 2:
+                time.sleep(0.5)
+            else:
+                print(f"[DB] Failed to save job {job['id']} after 3 retries.")
 
 
 # The GraphQL query string used to search for jobs on Upwork.
