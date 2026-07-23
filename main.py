@@ -6,11 +6,8 @@ import json
 import sqlite3
 import time
 import threading
-import collections
 import logging
-import psutil
 from logging.handlers import RotatingFileHandler
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -30,14 +27,21 @@ class _TeeWriter:
     """
 
     def __init__(self, filepath, stream):
+        self.filepath = filepath
         self.terminal = stream
         self.file = open(filepath, "a", encoding="utf-8")
         self._lock = threading.Lock()
+
+    def _ensure_open(self):
+        """Reopen the file if it was closed (e.g., by shutdown handler)."""
+        if self.file.closed:
+            self.file = open(self.filepath, "a", encoding="utf-8")
 
     def write(self, message):
         with self._lock:
             self.terminal.write(message)
             self.terminal.flush()
+            self._ensure_open()
             if message.strip():
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self.file.write(f"[{ts}] {message}")
@@ -47,6 +51,7 @@ class _TeeWriter:
 
     def flush(self):
         self.terminal.flush()
+        self._ensure_open()
         self.file.flush()
 
 
@@ -58,7 +63,7 @@ print(f"[Logging] Writing to {LOG_FILE}")
 
 import discord
 from discord.ext import commands
-from scraper import fetch_jobs, auth_manager
+from scraper import fetch_jobs, auth_manager, calculate_content_hash
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CONFIG_FILE = "channels_config.json"
@@ -70,139 +75,17 @@ DEFAULT_EXCLUDED = [
 CHANNEL_DELAY = 4
 # Delay between full scan cycles (seconds)
 CYCLE_DELAY = 10
-# Status endpoint port
-STATUS_PORT = 5000
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------------------------------------------------------------------------
-# Status tracking (for /status endpoint during stability testing)
+# Tracking variables
 # ---------------------------------------------------------------------------
-BOT_START_TIME = time.time()
-_error_log = collections.deque(maxlen=5000)  # (timestamp, channel, message)
 _cycles_completed = 0
 _total_jobs_posted = 0
-
-
-def log_error(channel_name, message):
-    """Record an error for the status endpoint."""
-    _error_log.append((time.time(), channel_name, str(message)))
-
-
-def count_recent_jobs(hours=1):
-    """Count jobs posted in the last N hours from SQLite."""
-    try:
-        conn = sqlite3.connect("jobs.db", timeout=5)
-        cursor = conn.cursor()
-        cutoff = datetime.now().isoformat()[:10]  # rough cutoff
-        cursor.execute(
-            "SELECT COUNT(*) FROM jobs WHERE posted = 1 AND last_seen > datetime('now', ?)",
-            (f"-{hours} hours",)
-        )
-        count = cursor.fetchone()[0]
-        conn.close()
-        return count
-    except Exception:
-        return -1
-
-
-def count_recent_errors(hours=1):
-    """Count errors logged in the last N hours."""
-    cutoff = time.time() - (hours * 3600)
-    return sum(1 for ts, _, _ in _error_log if ts > cutoff)
-
-
-def build_status_json():
-    """Build the full status dictionary."""
-    now = time.time()
-    uptime_secs = now - BOT_START_TIME
-    uptime_hours = round(uptime_secs / 3600, 2)
-
-    # Memory usage of the Python process
-    try:
-        proc = psutil.Process(os.getpid())
-        mem_mb = round(proc.memory_info().rss / (1024 * 1024), 1)
-    except Exception:
-        mem_mb = -1
-
-    # Chrome process memory (if running)
-    chrome_mem_mb = 0
-    try:
-        for p in psutil.process_iter(['name', 'memory_info']):
-            if p.info['name'] and 'chrome' in p.info['name'].lower():
-                chrome_mem_mb += round(p.info['memory_info'].rss / (1024 * 1024), 1)
-        chrome_mem_mb = round(chrome_mem_mb, 1)
-    except Exception:
-        chrome_mem_mb = -1
-
-    # Auth manager status
-    am = auth_manager
-    last_refresh_ago = round((now - am._last_refresh) / 60, 1) if am._last_refresh else None
-    last_browser_start_ago = round((now - am._last_browser_start) / 3600, 2) if am._last_browser_start else None
-    browser_alive = am._is_driver_alive() if am._started else False
-
-    # Tracked channels
-    config = load_channels_config()
-    tracked = config.get("tracked", {})
-
-    return {
-        "uptime_hours": uptime_hours,
-        "uptime_human": f"{int(uptime_secs // 86400)}d {int((uptime_secs % 86400) // 3600)}h {int((uptime_secs % 3600) // 60)}m",
-        "cycles_completed": _cycles_completed,
-        "total_jobs_posted": _total_jobs_posted,
-        "jobs_posted_last_hour": count_recent_jobs(1),
-        "browser": {
-            "alive": browser_alive,
-            "last_refresh_mins_ago": last_refresh_ago,
-            "last_browser_restart_hours_ago": last_browser_start_ago,
-        },
-        "memory": {
-            "python_process_mb": mem_mb,
-            "chrome_total_mb": chrome_mem_mb,
-        },
-        "active_channels": len(tracked),
-        "channels": list(tracked.keys()),
-        "errors_last_hour": count_recent_errors(1),
-        "total_errors_logged": len(_error_log),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Status HTTP server (runs in background thread)
-# ---------------------------------------------------------------------------
-
-class _StatusHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path in ("/status", "/"):
-            try:
-                data = build_status_json()
-                body = json.dumps(data, indent=2).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(str(e).encode())
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, fmt, *args):
-        # Suppress default access logs
-        pass
-
-
-def _start_status_server():
-    """Start the status HTTP server in a daemon thread."""
-    server = HTTPServer(("0.0.0.0", STATUS_PORT), _StatusHandler)
-    server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    print(f"[Status] Endpoint running at http://localhost:{STATUS_PORT}/status")
-
+_shutting_down = False  # Flag to prevent race conditions during shutdown
 
 # ---------------------------------------------------------------------------
 # Time formatting helpers
@@ -236,7 +119,8 @@ def format_relative_time(publish_time_str):
             return "Just now"
         mins = int(total_seconds // 60)
         hours = int(total_seconds // 3600)
-        days = int(total_seconds // 86400)
+        # Round to nearest day (5.5+ days = 6 days)
+        days = round(total_seconds / 86400)
 
         if mins < 1:
             return "Just now"
@@ -272,15 +156,37 @@ def save_channels_config(config):
 
 
 def scan_and_update_channels():
-    """Scan all text channels in every guild the bot is in and update config."""
+    """Scan all text channels in every guild the bot is in and update config.
+
+    - Adds new channels to tracking
+    - Removes channels that no longer exist in Discord (deleted while bot was offline)
+    """
     config = load_channels_config()
     tracked = config.setdefault("tracked", {})
     excluded = config.get("excluded", list(DEFAULT_EXCLUDED))
 
+    # Collect all current channel IDs and names from Discord
+    current_channels = {}  # name -> id
     for guild in bot.guilds:
         for channel in guild.text_channels:
             if channel.name not in excluded:
-                tracked[channel.name] = channel.id
+                current_channels[channel.name] = channel.id
+
+    # Remove tracked channels that no longer exist in Discord
+    removed = []
+    for name, cid in list(tracked.items()):
+        if cid not in current_channels.values():
+            del tracked[name]
+            removed.append(name)
+            print(f"[Config] Removed deleted channel: #{name}")
+
+    # Add new channels
+    added = []
+    for name, cid in current_channels.items():
+        if name not in tracked:
+            tracked[name] = cid
+            added.append(name)
+            print(f"[Config] Added new channel: #{name} ({cid})")
 
     config["excluded"] = excluded
     save_channels_config(config)
@@ -291,16 +197,34 @@ def scan_and_update_channels():
 # Database functions
 # ---------------------------------------------------------------------------
 
-def is_job_posted(job_id):
-    """Check if a job was already posted to any channel."""
+def is_job_posted(job_id, job=None):
+    """Check if a job was already posted to any channel.
+
+    If job is provided, also checks if the job content has changed (updated).
+    If the content hash doesn't match, resets the posted flag and returns False.
+    """
     for attempt in range(3):
         try:
             conn = sqlite3.connect("jobs.db", timeout=10)
             cursor = conn.cursor()
-            cursor.execute("SELECT posted FROM jobs WHERE id = ?", (job_id,))
+            cursor.execute("SELECT posted, content_hash FROM jobs WHERE id = ?", (job_id,))
             row = cursor.fetchone()
             conn.close()
-            return row and row[0] == 1
+
+            if not row or row[0] != 1:
+                return False
+
+            # Job was posted, but check if it has been updated
+            if job is not None:
+                stored_hash = row[1]
+                current_hash = calculate_content_hash(job)
+                if stored_hash != current_hash:
+                    # Job was updated, reset posted flag
+                    print(f"[Update] Job {job_id} content changed, will repost.")
+                    mark_job_posted(job_id, reset=True)
+                    return False
+
+            return True
         except sqlite3.OperationalError:
             if attempt < 2:
                 time.sleep(0.5)
@@ -309,13 +233,16 @@ def is_job_posted(job_id):
                 return False
 
 
-def mark_job_posted(job_id):
-    """Mark a job as posted (first-come-first-served: once posted to any channel, never reposted)."""
+def mark_job_posted(job_id, reset=False):
+    """Mark a job as posted (or reset if updated)."""
     for attempt in range(3):
         try:
             conn = sqlite3.connect("jobs.db", timeout=10)
             cursor = conn.cursor()
-            cursor.execute("UPDATE jobs SET posted = 1 WHERE id = ?", (job_id,))
+            if reset:
+                cursor.execute("UPDATE jobs SET posted = 0 WHERE id = ?", (job_id,))
+            else:
+                cursor.execute("UPDATE jobs SET posted = 1 WHERE id = ?", (job_id,))
             conn.commit()
             conn.close()
             return
@@ -345,7 +272,6 @@ async def on_ready():
     print(f"Excluded: {', '.join(excluded)}")
 
     bot.loop.create_task(job_scraper_task())
-    _start_status_server()
 
 
 @bot.event
@@ -481,6 +407,38 @@ async def add_channel(ctx, channel_name: str):
     await ctx.send(f"Created #{channel_name} ({new_channel.id}) and added to tracking.")
 
 
+@bot.command(name="delete")
+async def delete_channel(ctx, channel_name: str):
+    """Delete a channel from Discord and stop tracking it. Usage: !delete next"""
+    config = load_channels_config()
+    tracked = config.get("tracked", {})
+
+    # Find the channel by name in the guild
+    channel = discord.utils.get(ctx.guild.text_channels, name=channel_name)
+
+    if not channel:
+        await ctx.send(f"Channel #{channel_name} not found in this server.")
+        return
+
+    # Delete the channel from Discord
+    try:
+        await channel.delete()
+    except discord.Forbidden:
+        await ctx.send(f"I don't have permission to delete channels in this server.")
+        return
+    except Exception as e:
+        await ctx.send(f"Failed to delete channel: {e}")
+        return
+
+    # Remove from tracking config
+    if channel_name in tracked:
+        del tracked[channel_name]
+        save_channels_config(config)
+        await ctx.send(f"Deleted #{channel_name} and removed from tracking.")
+    else:
+        await ctx.send(f"Deleted #{channel_name} (was not being tracked).")
+
+
 # ---------------------------------------------------------------------------
 # Multi-channel scraper loop
 # ---------------------------------------------------------------------------
@@ -497,12 +455,17 @@ async def job_scraper_task():
     """
     global _cycles_completed, _total_jobs_posted
     await bot.wait_until_ready()
-    while not bot.is_closed():
+    while not bot.is_closed() and not _shutting_down:
         config = load_channels_config()
         tracked = config.get("tracked", {})
         excluded = config.get("excluded", [])
 
         for channel_name, channel_id in list(tracked.items()):
+            # Check shutdown flag before each channel
+            if _shutting_down:
+                print("[Scraper] Shutdown requested, stopping...")
+                return
+
             if channel_name in excluded:
                 continue
 
@@ -525,12 +488,14 @@ async def job_scraper_task():
                 else:
                     posted_count = 0
                     for job in jobs:
-                        if is_job_posted(job["id"]):
+                        if is_job_posted(job["id"], job):
                             continue
 
                         detected_time = datetime.now().strftime("%H:%M")
                         posted_ago = format_relative_time(job.get("publish_time"))
 
+                        skills_str = ', '.join(job['skills'])
+                        # Build message with all fields
                         main_message = (
                             f"**New Job Posted!**\n"
                             f"**Title:** {job['title']}\n"
@@ -538,20 +503,28 @@ async def job_scraper_task():
                             f"**Level:** {job['experience_level']}\n"
                             f"**Posted:** {posted_ago}\n"
                             f"**Detected:** {detected_time}\n"
-                            f"**Skills:** {', '.join(job['skills'])}"
+                            f"**Skills:** {skills_str}"
                         )
+
+                        # Simple hard cap at 1900 chars — bulletproof
+                        if len(main_message) > 1900:
+                            main_message = main_message[:1897] + "..."
 
                         message = await channel.send(main_message)
                         thread = await message.create_thread(
                             name=f"Job: {job['title'][:80]}",
                             auto_archive_duration=60,
                         )
-                        thread_message = (
-                            f"**Full Job Description**:\n"
-                            f"{job['full_description']}\n\n"
-                            f"[Apply on Upwork]({job['url']})"
-                        )
-                        await thread.send(thread_message[:2000])
+                        apply_link = f"\n\n[Apply on Upwork]({job['url']})"
+                        header = "**Full Job Description**:\n"
+                        # Reserve space for header and apply link, truncate description
+                        max_desc_len = 1900 - len(header) - len(apply_link)
+                        description = job['full_description']
+                        if len(description) > max_desc_len:
+                            description = description[:max_desc_len] + "..."
+                        thread_message = header + description + apply_link
+
+                        await thread.send(thread_message)
 
                         mark_job_posted(job["id"])
                         posted_count += 1
@@ -566,8 +539,11 @@ async def job_scraper_task():
                     else:
                         print(f"  Posted {posted_count} new job(s) to #{channel_name}.")
             except Exception as e:
-                log_error(channel_name, e)
                 print(f"[ERROR] Channel #{channel_name} failed: {e}")
+                if 'main_message' in locals():
+                    print(f"[DEBUG] main_message length: {len(main_message)}")
+                if 'thread_message' in locals():
+                    print(f"[DEBUG] thread_message length: {len(thread_message)}")
                 print(f"[ERROR] Continuing to next channel...")
 
             # Break between channels to avoid hammering Upwork
@@ -583,10 +559,28 @@ async def job_scraper_task():
 # ---------------------------------------------------------------------------
 
 def signal_handler(sig, frame):
+    global _shutting_down
     print("\nShutting down bot...")
+
+    # Set flag first to stop the scraper loop
+    _shutting_down = True
+
+    # Give the scraper loop time to finish current operation
+    time.sleep(2)
+
+    # Now close the browser
     auth_manager.stop()
-    _tee_out.file.close()
-    _tee_err.file.close()
+
+    # Close log files
+    try:
+        _tee_out.file.close()
+    except:
+        pass
+    try:
+        _tee_err.file.close()
+    except:
+        pass
+
     sys.exit(0)
 
 
@@ -598,7 +592,18 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nBot terminated by user")
     finally:
-        auth_manager.stop()
-        _tee_out.file.close()
-        _tee_err.file.close()
+        _shutting_down = True
+        time.sleep(1)
+        try:
+            auth_manager.stop()
+        except:
+            pass
+        try:
+            _tee_out.file.close()
+        except:
+            pass
+        try:
+            _tee_err.file.close()
+        except:
+            pass
         print("Cleanup complete")
