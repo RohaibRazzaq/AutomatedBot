@@ -117,10 +117,11 @@ def format_relative_time(publish_time_str):
 
         if total_seconds < 0:
             return "Just now"
+            
         mins = int(total_seconds // 60)
         hours = int(total_seconds // 3600)
-        # Round to nearest day (5.5+ days = 6 days)
-        days = round(total_seconds / 86400)
+        days = int(total_seconds // 86400)
+        weeks = int(total_seconds // 604800)
 
         if mins < 1:
             return "Just now"
@@ -128,8 +129,17 @@ def format_relative_time(publish_time_str):
             return f"{mins} min{'s' if mins != 1 else ''} ago"
         elif hours < 24:
             return f"{hours} hour{'s' if hours != 1 else ''} ago"
+        elif days == 1:
+            return "Yesterday"
+        elif days < 7:
+            return f"{days} days ago"
+        elif weeks < 4:
+            return f"{weeks} week{'s' if weeks != 1 else ''} ago"
         else:
-            return f"{days} day{'s' if days != 1 else ''} ago"
+            months = int(days // 30)
+            if months == 0:
+                months = 1
+            return f"{months} month{'s' if months != 1 else ''} ago"
     except Exception:
         return str(publish_time_str)
 

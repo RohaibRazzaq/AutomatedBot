@@ -14,6 +14,11 @@ auth_manager = AuthManager(headless=BROWSER_HEADLESS)
 # Cache for job IDs that have been checked and found to be private (temporary, for current session)
 _checked_private_job_ids = set()
 
+# Temporary session cache for jobs whose public/private state could not be
+# verified due to network/browser issues. These are not permanently cached as
+# private, so they can be retried on later scans without poisoning the list.
+_unknown_job_ids = set()
+
 # JSON file to store all skipped job IDs (persists across restarts)
 SKIPPED_JOBS_FILE = 'skipped_jobs.json'
 
@@ -273,8 +278,8 @@ def _filter_private_jobs_via_browser(clean_jobs):
     }).then(function(r) {
         clearTimeout(timeoutId);
         if (!r.ok) {
-            // Strict mode: HTTP errors (403, 404) mean job is not accessible
-            callback(JSON.stringify({public: false, reason: 'http_error', status: r.status}));
+            // A transient HTTP/access issue is ambiguous, not proof of a private listing.
+            callback(JSON.stringify({public: false, classification: 'unknown', reason: 'http_error', status: r.status}));
             return '';
         }
         var reader = r.body.getReader();
@@ -314,17 +319,21 @@ def _filter_private_jobs_via_browser(clean_jobs):
             lower.indexOf('log in to view') !== -1
         );
         
-        var isPublic = !isPrivateListing && !requiresLogin;
+        // Only explicitly private listings should be rejected.
+        // A public job can still require sign-in for the application flow.
+        var isPublic = !isPrivateListing;
+        var classification = isPrivateListing ? 'private' : 'public';
         
         callback(JSON.stringify({
             public: isPublic,
+            classification: classification,
             requiresLogin: requiresLogin,
             isPrivateListing: isPrivateListing
         }));
     }).catch(function(e) {
         clearTimeout(timeoutId);
-        // Strict mode: on error, assume private (don't let private jobs slip through)
-        callback(JSON.stringify({public: false, reason: 'fetch_error', error: e.name === 'AbortError' ? 'timeout' : e.message}));
+        // Treat browser-side failures as unknown rather than private.
+        callback(JSON.stringify({public: false, classification: 'unknown', reason: 'fetch_error', error: e.name === 'AbortError' ? 'timeout' : e.message}));
     });
     """
 
@@ -349,6 +358,12 @@ def _filter_private_jobs_via_browser(clean_jobs):
             skipped += 1
             print(f"[Filter] Skipped job (cached private): {job['title']}")
             continue
+
+        # Skip if this job was already marked as ambiguous in this session.
+        if job_id in _unknown_job_ids:
+            skipped += 1
+            print(f"[Filter] Skipped job (ambiguous on previous check): {job['title']}")
+            continue
         
         if not url:
             # Strict mode: skip jobs without URLs (can't verify if public)
@@ -370,26 +385,34 @@ def _filter_private_jobs_via_browser(clean_jobs):
                 result = auth_manager.sb.driver.execute_async_script(js_check_url, url, 10000, 15000)
                 data = json.loads(result)
 
-            if not data.get('public'):
+            classification = data.get('classification', 'public')
+
+            if classification == 'private':
                 skipped += 1
                 reason = data.get('reason', 'not_public')
                 
-                # Save ALL skipped jobs to JSON file (including 403/404) for quick lookup
+                # Save explicitly private jobs to the JSON file for quick lookup.
                 if job_id:
                     save_skipped_job_id(job_id)
                     _checked_private_job_ids.add(job_id)
                 
+                reasons = []
+                if data.get('isPrivateListing'):
+                    reasons.append('private listing')
+                if data.get('requiresLogin'):
+                    reasons.append('requires login')
+                print(f"[Filter] Skipped job ({', '.join(reasons)}): {job['title']}")
+                continue
+
+            if classification == 'unknown':
+                skipped += 1
+                if job_id:
+                    _unknown_job_ids.add(job_id)
+                reason = data.get('reason', 'unknown')
                 if reason == 'http_error':
-                    print(f"[Filter] Skipped job (HTTP {data.get('status')}): {job['title']}")
+                    print(f"[Filter] Ambiguous job (HTTP {data.get('status')}) — not caching as private: {job['title']}")
                 elif reason == 'fetch_error':
-                    print(f"[Filter] Skipped job (fetch error: {data.get('error')}): {job['title']}")
-                else:
-                    reasons = []
-                    if data.get('isPrivateListing'):
-                        reasons.append('private listing')
-                    if data.get('requiresLogin'):
-                        reasons.append('requires login')
-                    print(f"[Filter] Skipped job ({', '.join(reasons)}): {job['title']}")
+                    print(f"[Filter] Ambiguous job (fetch error: {data.get('error')}) — not caching as private: {job['title']}")
                 continue
 
             public_jobs.append(job)
@@ -400,7 +423,7 @@ def _filter_private_jobs_via_browser(clean_jobs):
             print(f"[Filter] Skipped job (check failed): {job['title']} — {error_short}")
 
     if skipped > 0:
-        print(f"[Filter] Browser check skipped {skipped} private job(s).")
+        print(f"[Filter] Browser check skipped {skipped} job(s) after verification.")
 
     return public_jobs
 
